@@ -88,12 +88,13 @@ parser.add_argument('--cos', action='store_true',
 parser.add_argument('--output_dir', type=str,
                     default='weights/stage_i/',
                     help='path to store checkpoints')
+parser.add_argument('--num-segments', type=int, default=8)
 
 best_acc1 = 0
 
 def main():
     args = parser.parse_args()
-    args.num_class = 1000
+    args.num_class = 400
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -153,7 +154,8 @@ def main_worker(gpu, ngpus_per_node, args):
     print("=> creating model")
     model = SSD_LT.builder.SSFL(
         models.resnet.resnext50_32x4d,
-        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.num_class)
+        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.num_class,
+        args.num_segments)
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor

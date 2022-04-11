@@ -8,12 +8,14 @@ class SSFL(nn.Module):
     """
     Self Supervised guided Feature Learner
     """
-    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, class_num=1000):
+    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, class_num=400,
+                 num_segments=8):
         super(SSFL, self).__init__()
 
         self.K = K
         self.m = m
         self.T = T
+        self.num_segments = num_segments
 
         # create the encoders
         self.encoder_q = base_encoder()
@@ -107,7 +109,9 @@ class SSFL(nn.Module):
 
     def forward(self, im_q, im_k=None, labels=None):
         # compute query features
+        im_q = im_q.reshape((-1, 3) + im_q.shape[-2:])
         out_q = self.encoder_q(im_q)  # queries: NxC
+        out_q = out_q.reshape((-1, self.num_segments) + out_q.shape[1:]).mean(dim=1, keepdim=False)
         pred = self.classifier(out_q)
         if not self.training:
             return pred
@@ -122,7 +126,10 @@ class SSFL(nn.Module):
             # shuffle for making use of BN
             im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
 
+            if im_k is not None:
+                im_k = im_k.reshape((-1, 3) + im_q.shape[-2:])
             out_k = self.encoder_k(im_k)  # keys: NxC
+            out_k = out_k.reshape((-1, self.num_segments) + out_k.shape[1:]).mean(dim=1, keepdim=False)
             k = self.k_fc(out_k)
             k = nn.functional.normalize(k, dim=1)
 
@@ -165,9 +172,10 @@ class SLG(nn.Module):
     """
     Soft Labels Generator
     """
-    def __init__(self, base_encoder, classifier, class_num, weight_path):
+    def __init__(self, base_encoder, classifier, class_num, weight_path, num_segments=8):
         super(SLG, self).__init__()
 
+        self.num_segments = num_segments
         self.encoder = base_encoder()
         self.classifier = classifier(num_classes=class_num, feat_dim=2048)
         
@@ -192,7 +200,9 @@ class SLG(nn.Module):
         self.classifier.load_state_dict(classifier_weights, strict=False)
     
     def forward(self, x):
+        x = x.reshape((-1, 3) + x.shape[-2:])
         out = self.encoder(x)
+        out = out.reshape((-1, self.num_segments) + out.shape[1:]).mean(dim=1, keepdim=False)
         pred = self.classifier(out)
 
         return pred
@@ -201,10 +211,11 @@ class SDL(nn.Module):
     """
     Self Distillation Learner
     """
-    def __init__(self, base_encoder, classifier_t, class_num, T=2, teacher_ckpt=None):
+    def __init__(self, base_encoder, classifier_t, class_num, T=2, teacher_ckpt=None, num_segments=8):
         super(SDL, self).__init__()
 
         self.T = T
+        self.num_segments = num_segments
 
         self.encoder_q = base_encoder()
         self.encoder_t = base_encoder()  # teacher
@@ -222,7 +233,6 @@ class SDL(nn.Module):
         if teacher_ckpt is not None:
             self.load_teacher(teacher_ckpt)
 
-    
     def load_teacher(self, weight_path):
         assert weight_path is not None
         print('=> load teacher model weights from {}'.format(weight_path))
@@ -239,7 +249,9 @@ class SDL(nn.Module):
         self.classifier_t.load_state_dict(classifier_weights)
     
     def forward(self, img):
+        img = img.reshape((-1, 3) + img.shape[-2:])
         out_q = self.encoder_q(img)
+        out_q = out_q.reshape((-1, self.num_segments) + out_q.shape[1:]).mean(dim=1, keepdim=False)
         pred = self.classifier(out_q)
         pred_kd = self.classifier_kd(out_q)
 
@@ -247,7 +259,9 @@ class SDL(nn.Module):
             return pred, pred_kd
 
         with torch.no_grad():
+            img = img.reshape((-1, 3) + img.shape[-2:])
             out_t = self.encoder_t(img)
+            out_t = out_t.reshape((-1, self.num_segments) + out_t.shape[1:]).mean(dim=1, keepdim=False)
             pred_t = self.classifier_t(out_t)
         
         loss_kd = self.kd_loss(pred_kd, pred_t.detach())

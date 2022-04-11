@@ -4,7 +4,7 @@ from torch.nn.parameter import Parameter
 
 class DotProduct_Classifier(nn.Module):
     
-    def __init__(self, num_classes=1000, feat_dim=2048, *args):
+    def __init__(self, num_classes=400, feat_dim=2048, *args):
         super(DotProduct_Classifier, self).__init__()
         
         self.fc = nn.Linear(feat_dim, num_classes)

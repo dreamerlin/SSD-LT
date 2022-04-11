@@ -17,30 +17,40 @@ import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+from datasets import build_dataset
 
 from tqdm import tqdm
 
 import models.resnet
-import models.tau_norm_classifier
 import SSD_LT.loader
 import SSD_LT.builder
+
 from SSD_LT.utils import *
+import utils
+
+from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+import torchvision
+from mcloader.transforms_ss import *
+
+CLIP_DEFAULT_MEAN = (0.4815, 0.4578, 0.4082)
+CLIP_DEFAULT_STD = (0.2686, 0.2613, 0.2758)
+
 
 parser = argparse.ArgumentParser(description='SSD_LT ImageNet-LT Training')
 parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
-parser.add_argument('-j', '--workers', default=12, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
-parser.add_argument('--epochs', default=5, type=int, metavar='N',
+parser.add_argument('--epochs', default=135, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=512, type=int,
+parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.2, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--schedule', default=[120, 160], nargs='*', type=int,
                     help='learning rate schedule (when to drop lr by 10x)')
@@ -73,21 +83,77 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
+# moco specific configs:
+parser.add_argument('--moco-dim', default=128, type=int,
+                    help='feature dimension (default: 128)')
+parser.add_argument('--moco-k', default=115712, type=int,
+                    help='queue size; number of negative keys (default: 65536)')
+parser.add_argument('--moco-m', default=0.999, type=float,
+                    help='moco momentum of updating key encoder (default: 0.999)')
+parser.add_argument('--moco-t', default=0.2, type=float,
+                    help='softmax temperature (default: 0.07)')
+
 parser.add_argument('--cos', action='store_true',
                     help='use cosine lr schedule')
 parser.add_argument('--output_dir', type=str,
-                    default='weights/stage_ii/',
+                    default='weights/stage_i/',
                     help='path to store checkpoints')
-parser.add_argument('--last_stage_ckpt', type=str, default='')
-parser.add_argument('--num_samples_cls', type=int, default=2,
-                    help='number of samples per class for class-balanced sampling')
 parser.add_argument('--num-segments', type=int, default=8)
+parser.add_argument('--dense-sample', action='store_true')
+parser.add_argument('--test-crops', type=int, default=1)
+parser.add_argument('--num-clips', type=int, default=10)
+parser.add_argument('--test-batch-size', type=int, default=0)
+parser.add_argument('--use-softmax', action='store_true', default=False)
+parser.add_argument('--twice-sample', action='store_true')
+parser.add_argument('--dataset', type=str, default='Kinetics')
+parser.add_argument('--index-bias', type=int, default=0)
+parser.add_argument('--context-length', type=int, default=77)
+parser.add_argument('--io-backend', type=str, default='petrel')
+
 
 best_acc1 = 0
 
+def build_transform_val(is_train, args, split):
+    DEFAULT_MEAN = CLIP_DEFAULT_MEAN if args.clip_ms else IMAGENET_DEFAULT_MEAN
+    DEFAULT_STD = CLIP_DEFAULT_STD if args.clip_ms else IMAGENET_DEFAULT_STD
+    scale_size = args.input_size * 256 // 224
+    if is_train:
+        unique = torchvision.transforms.Compose([GroupMultiScaleCrop(args.input_size, [1, .875, .75, .66]),
+                                                 GroupRandomHorizontalFlip(is_sth='some' in args.data_set),
+                                                 GroupRandomColorJitter(p=0.8, brightness=0.4, contrast=0.4,
+                                                                        saturation=0.2, hue=0.1),
+                                                 GroupRandomGrayscale(p=0.2),
+                                                 GroupGaussianBlur(p=0.0),
+                                                 GroupSolarization(p=0.0)])
+    else:
+        if args.test_crops == 1 or split == 'val':
+            unique = torchvision.transforms.Compose([GroupScale(scale_size),
+                                                     GroupCenterCrop(args.input_size)])
+        elif args.test_crops == 3:
+            unique = torchvision.transforms.Compose([GroupFullResSample(args.input_size, scale_size, flip=False)])
+        elif args.test_crops == 5:
+            unique = torchvision.transforms.Compose([GroupOverSample(args.input_size, scale_size, flip=False)])
+        elif args.text_crops == 10:
+            unique = torchvision.transforms.Compose([GroupOverSample(args.input_size, scale_size)])
+        else:
+            raise ValueError("Only 1, 3, 5, 10 crops are supported while we got {}".format(args.test_crops))
+
+    common = torchvision.transforms.Compose([Stack(roll=False),
+                                             ToTorchFormatTensor(div=True),
+                                             GroupNormalize(DEFAULT_MEAN,
+                                                            DEFAULT_STD)])
+    return torchvision.transforms.Compose([unique, common])
+
 def main():
     args = parser.parse_args()
+    args = utils.update_from_config(args)
     args.num_class = 400
+    args.clip_ms = True
+    args.input_size = 224
+    scale_size = args.input_size * 256 // 224
+    args.scale_size = scale_size
+    args.only_video = True
+    args.select_num = 50
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -145,10 +211,10 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model")
-    model = SSD_LT.builder.SLG(
-        models.resnet.resnext50_32x4d, 
-        models.tau_norm_classifier.tau_norm_classifier,
-        args.num_class, args.last_stage_ckpt, args.num_segments)
+    model = SSD_LT.builder.SSFL(
+        models.resnet.resnext50_32x4d,
+        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.num_class,
+        args.num_segments)
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -180,9 +246,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-    
-    parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
-    optimizer = torch.optim.SGD(parameters, args.lr,
+
+    optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
@@ -198,9 +263,6 @@ def main_worker(gpu, ngpus_per_node, args):
                 checkpoint = torch.load(args.resume, map_location=loc)
             args.start_epoch = checkpoint['epoch']
             best_acc1 = checkpoint['best_acc1']
-            if args.gpu is not None:
-                # best_acc1 may be from a checkpoint from a different GPU
-                best_acc1 = best_acc1.to(args.gpu)
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
@@ -210,39 +272,51 @@ def main_worker(gpu, ngpus_per_node, args):
 
     cudnn.benchmark = True
 
-    # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
-    testdir = os.path.join(args.data, 'test')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-    train_augmentation = [
-        transforms.RandomResizedCrop(224),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        normalize
+
+    DEFAULT_MEAN = CLIP_DEFAULT_MEAN if args.clip_ms else IMAGENET_DEFAULT_MEAN
+    DEFAULT_STD = CLIP_DEFAULT_STD if args.clip_ms else IMAGENET_DEFAULT_STD
+
+    # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+    #                                  std=[0.229, 0.224, 0.225])
+
+    augmentation = [
+        GroupMultiScaleCrop(args.input_size, [1, .875, .75, .66]),
+        GroupRandomHorizontalFlip(is_sth='some' in args.data_set),
+        GroupRandomColorJitter(p=1.0, brightness=0.4, contrast=0.4,
+                               saturation=0.2, hue=0.1),
+        # GroupRandomGrayscale(p=0.2),
+        # GroupGaussianBlur(p=0.0),
+        # GroupSolarization(p=0.0),
+        Stack(roll=False),
+        ToTorchFormatTensor(div=True),
+        GroupNormalize(DEFAULT_MEAN, DEFAULT_STD)]
+
+    k_augmentation = [
+        GroupMultiScaleCrop(args.input_size, [1, .875, .75, .66]),
+        GroupRandomHorizontalFlip(is_sth='some' in args.data_set),
+        GroupRandomColorJitter(p=0.8, brightness=0.4, contrast=0.4,
+                               saturation=0.2, hue=0.1),
+        GroupRandomGrayscale(p=0.2),
+        GroupGaussianBlur(p=0.5),
+        # GroupSolarization(p=0.0),
+        Stack(roll=False),
+        ToTorchFormatTensor(div=True),
+        GroupNormalize(DEFAULT_MEAN, DEFAULT_STD)
     ]
 
-    valtest_augmentation = [
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        normalize,
-    ]
+    train_aug = SSD_LT.loader.TwoCropsTransform(transforms.Compose(augmentation),
+                                                transforms.Compose(k_augmentation))
+    val_aug = build_transform_val(is_train=False, args=args, split='val')
+    test_aug = build_transform_val(is_train=False, args=args, split='test')
 
-    train_dataset = datasets.ImageFolder(
-        traindir, transforms.Compose(train_augmentation)
-    )
-    val_dataset = datasets.ImageFolder(
-        valdir, transforms.Compose(valtest_augmentation)
-    )
-    test_dataset = datasets.ImageFolder(
-        testdir, transforms.Compose(valtest_augmentation)
-    )
+
+    train_dataset, args.nb_classes = build_dataset(split="train", args=args, transform=train_aug)
+    if args.test:
+        test_dataset, _ = build_dataset(split="test", args=args, transform=val_aug)
+    val_dataset, _ = build_dataset(split="val", args=args, transform=test_aug)
 
     if args.distributed:
-        train_sampler = SSD_LT.loader.DistributedClassAwareSampler(train_dataset, args.num_samples_cls)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
         train_sampler = None
 
@@ -294,34 +368,41 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':6.3f')
+    cls_losses = AverageMeter('Cls Losses', ':6.3f')
+    cont_losses = AverageMeter('Cont Losses', ':6.3f')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
+        [batch_time, data_time, losses, cls_losses, cont_losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
     model.train()
 
     end = time.time()
-    for i, (images, label, _) in enumerate(train_loader):
+    for i, (images, label, index) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
+            images[0] = images[0].cuda(args.gpu, non_blocking=True)
+            images[1] = images[1].cuda(args.gpu, non_blocking=True)
             label = label.cuda(args.gpu, non_blocking=True)
+            index = index.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        pred = model(images)
-        loss = criterion(pred, label)
+        pred, cont_loss = model(im_q=images[0], im_k=images[1], labels=label)
+        cls_loss = criterion(pred, label)
+        loss = cls_loss + cont_loss
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(pred, label, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        losses.update(loss.item(), images[0].size(0))
+        cls_losses.update(cls_loss.item(), images[0].size(0))
+        cont_losses.update(cont_loss.item(), images[0].size(0))
+        top1.update(acc1[0], images[0].size(0))
+        top5.update(acc5[0], images[0].size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
